@@ -170,6 +170,76 @@ def solve_captcha(driver):
         print(f"Error preparing CAPTCHA for solving: {str(e)}")
         return None 
 
+def save_to_excel(all_results):
+    """Save results to Excel file and return the filename."""
+    global LAST_EXCEL_FILENAME
+    
+    if not all_results:
+        print("\nNo results were collected!")
+        return None
+    
+    print("\n" + "="*50)
+    print(f"Processing {len(all_results)} results for Excel export...")
+    print("="*50)
+        
+    # Create a normalized DataFrame
+    # First, extract all possible subject codes while maintaining order
+    all_subjects = []
+    for result in all_results:
+        for key in result.keys():
+            if key not in ['USN', 'Student Name', 'Semester'] and key not in all_subjects:
+                all_subjects.append(key)
+    
+    print(f"Found {len(all_subjects)} unique subjects across all results")
+    
+    # Create rows for the DataFrame
+    rows = []
+    for result in all_results:
+        row = {'USN': result.get('USN', '')}
+        
+        # Add student info
+        for key, value in result.items():
+            if key in ['Student Name', 'Semester']:
+                row[key] = value
+        
+        # Add subject marks in the original order
+        for subject in all_subjects:
+            if subject in result:
+                subject_data = result[subject]
+                if isinstance(subject_data, dict):
+                    row[f"{subject}_Name"] = subject_data.get('Subject Name', '')
+                    row[f"{subject}_Internal"] = subject_data.get('Internal', '')
+                    row[f"{subject}_External"] = subject_data.get('External', '')
+                    row[f"{subject}_Total"] = subject_data.get('Total', '')
+                    row[f"{subject}_Result"] = subject_data.get('Result', '')
+        
+        rows.append(row)
+    
+    # Create DataFrame
+    df = pd.DataFrame(rows)
+    
+    # Save to Excel with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_filename = f"vtu_results_{timestamp}.xlsx"
+    
+    print(f"\nSaving data to Excel file: {excel_filename}")
+    print(f"DataFrame shape: {df.shape[0]} rows × {df.shape[1]} columns")
+    
+    # Display a sample of the data
+    if not df.empty:
+        print("\nSample data (first few rows):")
+        pd.set_option('display.max_columns', 10)
+        pd.set_option('display.width', 1000)
+        print(df.head(3).to_string())
+    
+    df.to_excel(excel_filename, index=False)
+    print(f"\nResults successfully saved to {excel_filename}")
+    
+    # Save the filename globally
+    LAST_EXCEL_FILENAME = excel_filename
+    
+    return excel_filename 
+
 def process_results(driver, usn_list, manual_mode=False):
     """Process results for a list of USNs."""
     global SKIP_CURRENT_USN, EXIT_PROCESSING
@@ -194,9 +264,16 @@ def process_results(driver, usn_list, manual_mode=False):
             processing_logs.append(log_message)
             break
             
-        # Reset the skip flag for the new USN
-        if retries == 0:  # Only reset if we're not in retry mode
-            SKIP_CURRENT_USN = False
+        # Check for skip request - handle immediately for quick response
+        if SKIP_CURRENT_USN:
+            usn = usn_list[i]
+            log_message = f"Skipping USN: {usn} as requested by user."
+            print(log_message)
+            processing_logs.append(log_message)
+            i += 1  # Move to next USN
+            retries = 0  # Reset retry counter
+            SKIP_CURRENT_USN = False  # Reset the skip flag
+            continue
         
         usn = usn_list[i]
         
@@ -213,6 +290,16 @@ def process_results(driver, usn_list, manual_mode=False):
         try:
             driver.get(base_url)
             time.sleep(2)  # Wait for page to load
+            
+            # Check for skip request again after page load
+            if SKIP_CURRENT_USN:
+                log_message = f"Skipping USN: {usn} as requested by user."
+                print(log_message)
+                processing_logs.append(log_message)
+                i += 1  # Move to next USN
+                retries = 0  # Reset retry counter
+                SKIP_CURRENT_USN = False  # Reset the skip flag
+                continue
         except Exception as e:
             log_message = f"Error loading page: {str(e)}"
             print(log_message)
@@ -255,13 +342,14 @@ def process_results(driver, usn_list, manual_mode=False):
         print(log_message)
         processing_logs.append(log_message)
         
-        # Check if we should skip this USN
+        # Check if we should skip this USN (one more check before CAPTCHA)
         if SKIP_CURRENT_USN:
-            log_message = f"User requested to skip USN: {usn}"
+            log_message = f"Skipping USN: {usn} as requested by user."
             print(log_message)
             processing_logs.append(log_message)
             i += 1  # Move to next USN
             retries = 0  # Reset retry counter
+            SKIP_CURRENT_USN = False  # Reset the skip flag
             continue
         
         # Find CAPTCHA input field
@@ -305,6 +393,13 @@ def process_results(driver, usn_list, manual_mode=False):
             captcha_timeout = time.time() + 60
             
             while time.time() < captcha_timeout and not page_changed and not invalid_captcha:
+                # Check for skip request during CAPTCHA wait
+                if SKIP_CURRENT_USN:
+                    log_message = f"Skipping USN: {usn} during CAPTCHA input."
+                    print(log_message)
+                    processing_logs.append(log_message)
+                    break
+                
                 try:
                     # Check for alert (invalid captcha)
                     try:
@@ -339,6 +434,13 @@ def process_results(driver, usn_list, manual_mode=False):
                     # Don't break here, just log the error and continue
                     time.sleep(0.5)
             
+            # If skip was requested during CAPTCHA wait
+            if SKIP_CURRENT_USN:
+                i += 1  # Move to next USN
+                retries = 0  # Reset retry counter
+                SKIP_CURRENT_USN = False  # Reset the skip flag
+                continue
+                
             # If invalid captcha was detected, move to next USN
             if invalid_captcha:
                 i += 1  # Move to next USN
@@ -440,6 +542,16 @@ def process_results(driver, usn_list, manual_mode=False):
             
             # Reset retry counter as we've passed CAPTCHA validation
             retries = 0
+        
+        # Check for skip request one more time before extracting results
+        if SKIP_CURRENT_USN:
+            log_message = f"Skipping USN: {usn} after CAPTCHA validation."
+            print(log_message)
+            processing_logs.append(log_message)
+            i += 1  # Move to next USN
+            retries = 0  # Reset retry counter
+            SKIP_CURRENT_USN = False  # Reset the skip flag
+            continue
         
         # Extract results
         try:
@@ -665,76 +777,6 @@ def process_results(driver, usn_list, manual_mode=False):
             retries = 0  # Reset retry counter
     
     return all_results, processing_logs 
-
-def save_to_excel(all_results):
-    """Save results to Excel file and return the filename."""
-    global LAST_EXCEL_FILENAME
-    
-    if not all_results:
-        print("\nNo results were collected!")
-        return None
-    
-    print("\n" + "="*50)
-    print(f"Processing {len(all_results)} results for Excel export...")
-    print("="*50)
-        
-    # Create a normalized DataFrame
-    # First, extract all possible subject codes
-    all_subjects = set()
-    for result in all_results:
-        for key in result.keys():
-            if key not in ['USN', 'Student Name', 'Semester']:  # Subject codes
-                all_subjects.add(key)
-    
-    print(f"Found {len(all_subjects)} unique subjects across all results")
-    
-    # Create rows for the DataFrame
-    rows = []
-    for result in all_results:
-        row = {'USN': result.get('USN', '')}
-        
-        # Add student info
-        for key, value in result.items():
-            if key in ['Student Name', 'Semester']:
-                row[key] = value
-        
-        # Add subject marks
-        for subject in all_subjects:
-            if subject in result:
-                subject_data = result[subject]
-                if isinstance(subject_data, dict):
-                    row[f"{subject}_Name"] = subject_data.get('Subject Name', '')
-                    row[f"{subject}_Internal"] = subject_data.get('Internal', '')
-                    row[f"{subject}_External"] = subject_data.get('External', '')
-                    row[f"{subject}_Total"] = subject_data.get('Total', '')
-                    row[f"{subject}_Result"] = subject_data.get('Result', '')
-        
-        rows.append(row)
-    
-    # Create DataFrame
-    df = pd.DataFrame(rows)
-    
-    # Save to Excel with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_filename = f"vtu_results_{timestamp}.xlsx"
-    
-    print(f"\nSaving data to Excel file: {excel_filename}")
-    print(f"DataFrame shape: {df.shape[0]} rows × {df.shape[1]} columns")
-    
-    # Display a sample of the data
-    if not df.empty:
-        print("\nSample data (first few rows):")
-        pd.set_option('display.max_columns', 10)
-        pd.set_option('display.width', 1000)
-        print(df.head(3).to_string())
-    
-    df.to_excel(excel_filename, index=False)
-    print(f"\nResults successfully saved to {excel_filename}")
-    
-    # Save the filename globally
-    LAST_EXCEL_FILENAME = excel_filename
-    
-    return excel_filename 
 
 # Define Flask routes
 @app.route('/')
