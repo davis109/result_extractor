@@ -8,6 +8,10 @@ import json
 import traceback
 import sys
 import re
+import cv2
+import numpy as np
+import pytesseract
+from PIL import Image
 from flask import Flask, request, jsonify, render_template, send_file, redirect, url_for
 from flask_cors import CORS
 from selenium import webdriver
@@ -21,6 +25,29 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 # 2Captcha API key - Replace with your actual API key
 API_KEY = "20480f95adb6216bc0e788f58c343c11"  # 2Captcha API key
+
+# Set Tesseract path - Look in multiple locations including API directory from VTU-Result-Scraper repo
+TESSERACT_PATHS = [
+    os.environ.get('TESSERACT_PATH'),  # From environment variable
+    r'C:\Program Files\Tesseract-OCR\tesseract.exe',  # Standard Windows install
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'API', 'Tesseract-OCR', 'tesseract.exe'),  # From API folder
+    r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',  # 32-bit Windows install
+    '/usr/bin/tesseract',  # Linux/Mac
+    '/usr/local/bin/tesseract',  # Linux/Mac alternate
+]
+
+# Find the first valid Tesseract path
+TESSERACT_PATH = None
+for path in TESSERACT_PATHS:
+    if path and os.path.exists(path):
+        TESSERACT_PATH = path
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+        TESSERACT_AVAILABLE = True
+        print(f"Tesseract found at: {TESSERACT_PATH}")
+        break
+else:
+    TESSERACT_AVAILABLE = False
+    print(f"Tesseract not found in any of the expected locations. OCR-based CAPTCHA solving will be disabled.")
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -86,9 +113,183 @@ def setup_driver():
         traceback.print_exc()
         return None
 
+def solve_captcha_with_ocr(driver):
+    """Solve CAPTCHA using OCR with Tesseract, using the approach from VTU-Result-Scraper."""
+    if not TESSERACT_AVAILABLE:
+        print("Tesseract is not available. Cannot use OCR-based CAPTCHA solving.")
+        return None
+        
+    try:
+        # Scroll to make sure the CAPTCHA is visible
+        try:
+            captcha_img = driver.find_element(By.CSS_SELECTOR, "img[alt='CAPTCHA code']")
+            if captcha_img:
+                # Scroll the element into view
+                driver.execute_script("arguments[0].scrollIntoView(true);", captcha_img)
+                # Scroll up a bit to center it
+                driver.execute_script("window.scrollBy(0, -150);")
+                # Wait a moment for the page to settle
+                time.sleep(0.5)
+        except:
+            print("Could not scroll to CAPTCHA, proceeding anyway")
+        
+        # Take a screenshot of the page
+        screenshot_path = 'python_org.png'
+        driver.save_screenshot(screenshot_path)
+        
+        # Read the screenshot and crop the CAPTCHA using hardcoded coordinates
+        # These coordinates are from the original VTU-Result-Scraper repo
+        img = cv2.imread(screenshot_path)
+        
+        # Try to find the CAPTCHA image element for better accuracy
+        try:
+            captcha_img = driver.find_element(By.CSS_SELECTOR, "img[alt='CAPTCHA code']")
+            if captcha_img:
+                # Get the location and size of the CAPTCHA element
+                location = captcha_img.location
+                size = captcha_img.size
+                
+                # Calculate the region of the CAPTCHA in the screenshot
+                left = int(location['x'])
+                top = int(location['y'])
+                right = int(location['x'] + size['width'])
+                bottom = int(location['y'] + size['height'])
+                
+                # Ensure the coordinates are within the image boundaries
+                img_height, img_width = img.shape[:2]
+                left = max(0, left)
+                top = max(0, top)
+                right = min(img_width, right)
+                bottom = min(img_height, bottom)
+                
+                # Crop the CAPTCHA region
+                crop_img = img[top:bottom, left:right]
+                print(f"Cropping CAPTCHA at dynamic coordinates: top={top}, bottom={bottom}, left={left}, right={right}")
+            else:
+                raise Exception("CAPTCHA element not found, using hardcoded coordinates")
+        except Exception as e:
+            print(f"Using hardcoded coordinates due to: {str(e)}")
+            # Fallback to hardcoded coordinates for CAPTCHA
+            try:
+                # VTU uses two types of captchas - try to detect which one we're seeing
+                # Check if the 2024 style CAPTCHA is visible
+                captcha_element = driver.find_element(By.XPATH, "//div[contains(text(), 'Enter Captcha Code')]")
+                if captcha_element:
+                    # This is the 2024 style CAPTCHA
+                    crop_img = img[595:640, 850:960]  # Coordinates for 2024 CAPTCHAs
+                    print("Using 2024 CAPTCHA coordinates")
+                else:
+                    raise Exception("2024 CAPTCHA element not found")
+            except:
+                # Use the original VTU-Result-Scraper coordinates as last resort
+                crop_img = img[467:508, 667:885]
+                print("Using original VTU-Result-Scraper coordinates")
+                
+        # Output the shape of the cropped image for debugging
+        print(f"Cropped CAPTCHA image shape: {crop_img.shape}")
+            
+        # Save the cropped image in a larger size to help OCR
+        resized_crop = cv2.resize(crop_img, (0, 0), fx=2, fy=2)
+        cv2.imwrite('cap.png', resized_crop)
+        
+        # Process image for better OCR results - multiple approaches for better results
+        processed_images = []
+        
+        # Approach 1: Grayscale + Binary
+        gray = cv2.cvtColor(resized_crop, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+        kernel = np.ones((2, 2), np.uint8)
+        processed1 = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        processed_images.append(("binary", processed1))
+        
+        # Approach 2: Grayscale + Adaptive threshold
+        adaptive_thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+        processed2 = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_OPEN, kernel)
+        processed_images.append(("adaptive", processed2))
+        
+        # Approach 3: Grayscale + Otsu threshold
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        processed3 = cv2.morphologyEx(otsu, cv2.MORPH_OPEN, kernel)
+        processed_images.append(("otsu", processed3))
+        
+        # Approach 4: Enhanced contrast
+        enhanced = cv2.equalizeHist(gray)
+        _, enhanced_binary = cv2.threshold(enhanced, 150, 255, cv2.THRESH_BINARY_INV)
+        processed4 = cv2.morphologyEx(enhanced_binary, cv2.MORPH_OPEN, kernel)
+        processed_images.append(("enhanced", processed4))
+        
+        # Save all processed images
+        for i, (name, img) in enumerate(processed_images):
+            cv2.imwrite(f'cap_processed_{name}.png', img)
+        
+        # Try all processing methods to find a valid CAPTCHA
+        captcha_results = []
+        
+        # Also try the original cropped image
+        captcha_results.append(("original", pytesseract.image_to_string(
+            Image.open('cap.png'), 
+            config=r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+        ).strip()))
+        
+        # Try each processed image
+        for name, _ in processed_images:
+            # Use Tesseract with alphanumeric whitelist
+            result = pytesseract.image_to_string(
+                Image.open(f'cap_processed_{name}.png'), 
+                config=r'--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+            ).strip()
+            
+            captcha_results.append((name, result))
+        
+        # Print all results for debugging
+        for method, result in captcha_results:
+            print(f"OCR result ({method}): '{result}'")
+        
+        # Find the best result - one that has at least 6 alphanumeric characters
+        for method, result in captcha_results:
+            # Clean the result - keep only alphanumeric characters
+            cleaned_result = ''.join(c for c in result if c.isalnum())
+            if cleaned_result and len(cleaned_result) >= 6:
+                print(f"Found valid CAPTCHA from {method}: {cleaned_result}")
+                
+                # Clean up temporary files
+                try:
+                    os.remove(screenshot_path)
+                    os.remove('cap.png')
+                    for name, _ in processed_images:
+                        os.remove(f'cap_processed_{name}.png')
+                except Exception as e:
+                    print(f"Error removing temporary files: {str(e)}")
+                    
+                return cleaned_result
+        
+        # If no valid result was found
+        print("No valid CAPTCHA detected from OCR")
+        return None
+            
+    except Exception as e:
+        print(f"Error during OCR CAPTCHA solving: {str(e)}")
+        traceback.print_exc()
+        return None
+
 def solve_captcha(driver):
-    """Solve CAPTCHA using 2Captcha service."""
-    if not API_KEY or API_KEY == "YOUR_2CAPTCHA_API_KEY":
+    """Solve CAPTCHA using either OCR with Tesseract or 2Captcha service."""
+    # First try with Tesseract OCR if available
+    if TESSERACT_AVAILABLE:
+        print("Attempting to solve CAPTCHA with Tesseract OCR...")
+        for attempt in range(3):  # Try OCR up to 3 times with different processing
+            captcha_text = solve_captcha_with_ocr(driver)
+            if captcha_text:
+                print(f"Successfully solved CAPTCHA with OCR: {captcha_text}")
+                return captcha_text
+            print(f"OCR attempt {attempt+1} failed, trying again...")
+        
+        print("OCR-based CAPTCHA solving failed after 3 attempts, falling back to 2Captcha...")
+    else:
+        print("Tesseract is not available, falling back to 2Captcha...")
+    
+    # If OCR fails or isn't available, fall back to 2Captcha
+    if not API_KEY or API_KEY == "YOUR_2CAPTCHA_API_KEY" or API_KEY == "20480f95adb6216bc0e788f58c343c11":
         print("WARNING: No valid 2Captcha API key provided. You need to sign up at 2captcha.com and get an API key.")
         return None
         
@@ -255,6 +456,21 @@ def process_results(driver, usn_list, manual_mode=False):
     i = 0
     max_retries = 3  # Maximum number of CAPTCHA retries for each USN
     retries = 0      # Current retry count
+    auto_captcha_failures = 0  # Track consecutive auto captcha failures
+    
+    # Check if automatic CAPTCHA solving is available
+    auto_captcha = TESSERACT_AVAILABLE or (API_KEY and API_KEY != "YOUR_2CAPTCHA_API_KEY" and API_KEY != "20480f95adb6216bc0e788f58c343c11")
+    
+    # Force manual mode if no auto captcha solving available
+    if not auto_captcha and not manual_mode:
+        manual_mode = True
+        log_message = "No automatic CAPTCHA solving methods available. Switching to manual mode."
+        print(log_message)
+        processing_logs.append(log_message)
+    elif auto_captcha and manual_mode:
+        log_message = "Note: Manual mode is enabled but automatic CAPTCHA solving is available. Will try automatic solving first."
+        print(log_message)
+        processing_logs.append(log_message)
     
     while i < len(usn_list):
         # Check if we should exit processing early
@@ -286,6 +502,15 @@ def process_results(driver, usn_list, manual_mode=False):
         print(log_message)
         processing_logs.append(log_message)
         
+        # If we've had too many consecutive auto CAPTCHA failures, switch to manual mode for this USN
+        if auto_captcha_failures >= 3 and not manual_mode:
+            log_message = f"Too many automatic CAPTCHA failures in a row. Switching to manual mode for this USN."
+            print(log_message)
+            processing_logs.append(log_message)
+            manual_mode_for_this_usn = True
+        else:
+            manual_mode_for_this_usn = manual_mode
+        
         # Navigate to the results page
         try:
             driver.get(base_url)
@@ -311,8 +536,8 @@ def process_results(driver, usn_list, manual_mode=False):
         # Try different selectors for the USN input field
         usn_input = None
         selectors = [
-            "input[placeholder='ENTER USN']",
             "input[name='lns']",
+            "input[placeholder='ENTER USN']",
             "input.form-control[type='text']",
             "input[minlength='10'][maxlength='10']"
         ]
@@ -369,8 +594,114 @@ def process_results(driver, usn_list, manual_mode=False):
         
         captcha_text = None
         
-        # In manual mode, we let the user type the captcha
-        if manual_mode:
+        # Try automatic CAPTCHA solving first
+        if not manual_mode_for_this_usn and auto_captcha:
+            log_message = "Attempting automatic CAPTCHA solving..."
+            print(log_message)
+            processing_logs.append(log_message)
+            
+            captcha_text = solve_captcha(driver)
+            
+            if captcha_text:
+                log_message = f"Successfully solved CAPTCHA automatically: {captcha_text}"
+                print(log_message)
+                processing_logs.append(log_message)
+                
+                # Enter the CAPTCHA text
+                captcha_input.clear()
+                captcha_input.send_keys(captcha_text)
+                
+                # Find and click the submit button
+                try:
+                    submit_button = driver.find_element(By.CSS_SELECTOR, "input[type='submit']")
+                    submit_button.click()
+                    log_message = "Clicked submit button"
+                    print(log_message)
+                    processing_logs.append(log_message)
+                except NoSuchElementException:
+                    log_message = "Could not find submit button"
+                    print(log_message)
+                    processing_logs.append(log_message)
+                    i += 1  # Move to next USN
+                    retries = 0  # Reset retry counter
+                    continue
+                
+                # Wait for results page to load
+                log_message = "Waiting for results page to load..."
+                print(log_message)
+                processing_logs.append(log_message)
+                time.sleep(3)
+                
+                # Check for alert (invalid captcha)
+                try:
+                    alert = driver.switch_to.alert
+                    alert_text = alert.text
+                    log_message = f"Alert detected: {alert_text}"
+                    print(log_message)
+                    processing_logs.append(log_message)
+                    
+                    if "Invalid captcha" in alert_text:
+                        log_message = f"Invalid CAPTCHA detected for {usn}."
+                        print(log_message)
+                        processing_logs.append(log_message)
+                        alert.accept()  # Dismiss the alert
+                        
+                        # Increment failures counter
+                        auto_captcha_failures += 1
+                        
+                        # Try again or fall back to manual
+                        if retries < max_retries:
+                            retries += 1
+                            log_message = f"Automatic CAPTCHA solving failed for {usn}. Will retry (Attempt {retries+1}/{max_retries+1})."
+                            print(log_message)
+                            processing_logs.append(log_message)
+                            continue  # Retry the same USN
+                        else:
+                            log_message = f"Maximum automatic CAPTCHA retries ({max_retries+1}) reached for {usn}. Falling back to manual input."
+                            print(log_message)
+                            processing_logs.append(log_message)
+                            manual_mode_for_this_usn = True  # Fall back to manual for this USN
+                            continue  # Try again with manual mode
+                except:
+                    # No alert present, check page source if possible
+                    try:
+                        if "ENTER USN" in driver.page_source or "captchacode" in driver.page_source:
+                            # Still on input page, CAPTCHA failed
+                            if retries < max_retries:
+                                retries += 1
+                                auto_captcha_failures += 1
+                                log_message = f"Automatic CAPTCHA solving failed for {usn}. Will retry (Attempt {retries+1}/{max_retries+1})."
+                                print(log_message)
+                                processing_logs.append(log_message)
+                                continue  # Retry the same USN
+                            else:
+                                log_message = f"Maximum automatic CAPTCHA retries ({max_retries+1}) reached for {usn}. Falling back to manual input."
+                                print(log_message)
+                                processing_logs.append(log_message)
+                                manual_mode_for_this_usn = True  # Fall back to manual for this USN
+                                continue  # Try again with manual mode
+                        else:
+                            # Not on input page, CAPTCHA passed
+                            auto_captcha_failures = 0  # Reset failures counter
+                            retries = 0  # Reset retry counter
+                    except:
+                        # Can't check page source, assume we need to try manual
+                        log_message = "Could not verify CAPTCHA success. Falling back to manual input."
+                        print(log_message)
+                        processing_logs.append(log_message)
+                        manual_mode_for_this_usn = True  # Fall back to manual for this USN
+                        continue  # Try again with manual mode
+            else:
+                # No CAPTCHA text was returned
+                auto_captcha_failures += 1
+                log_message = "Automatic CAPTCHA solving failed to produce a result. Falling back to manual input."
+                print(log_message)
+                processing_logs.append(log_message)
+                manual_mode_for_this_usn = True  # Fall back to manual for this USN
+                continue  # Try again with manual mode
+        
+        # If automatic solving failed or manual mode is enabled
+        if manual_mode_for_this_usn:
             log_message = "Manual mode enabled. Please look at the browser window and type the CAPTCHA and click Submit."
             print(log_message)
             processing_logs.append(log_message)
@@ -794,7 +1125,7 @@ def scrape():
         data = request.json
         start_usn = data.get('start_usn')
         end_usn = data.get('end_usn')
-        interactive_mode = data.get('interactive_mode', False)
+        interactive_mode = data.get('interactive_mode', True)  # Default to interactive mode
         
         if not start_usn or not end_usn:
             return jsonify({'error': 'Start and end USN required'}), 400
@@ -969,18 +1300,59 @@ def download_file(filename):
 
 @app.route('/api/check_api_key', methods=['GET'])
 def check_api_key():
-    """Check if a valid 2Captcha API key is configured."""
-    if not API_KEY or API_KEY == "YOUR_2CAPTCHA_API_KEY" or API_KEY == "20480f95adb6216bc0e788f58c343c11":
+    """Check if valid captcha solving methods are available."""
+    services = []
+    status_message = ""
+    
+    # Check Tesseract OCR
+    if TESSERACT_AVAILABLE:
+        services.append({
+            "name": "Tesseract OCR",
+            "status": "available",
+            "description": "Local CAPTCHA solving using OCR (free)"
+        })
+        status_message = "Tesseract OCR is available for local CAPTCHA solving. "
+    else:
+        services.append({
+            "name": "Tesseract OCR",
+            "status": "unavailable",
+            "description": "Install Tesseract OCR for free local CAPTCHA solving: https://github.com/UB-Mannheim/tesseract/wiki"
+        })
+    
+    # Check 2Captcha API
+    if API_KEY and API_KEY != "YOUR_2CAPTCHA_API_KEY" and API_KEY != "20480f95adb6216bc0e788f58c343c11":
+        services.append({
+            "name": "2Captcha API",
+            "status": "available",
+            "description": "Online CAPTCHA solving service (paid)"
+        })
+        status_message += "2Captcha API key is configured for online CAPTCHA solving."
+    else:
+        services.append({
+            "name": "2Captcha API",
+            "status": "unavailable",
+            "description": "No valid 2Captcha API key configured. Get one at 2captcha.com"
+        })
+        status_message += "No valid 2Captcha API key is configured."
+    
+    # Determine overall status
+    has_auto_captcha = TESSERACT_AVAILABLE or (API_KEY and API_KEY != "YOUR_2CAPTCHA_API_KEY" and API_KEY != "20480f95adb6216bc0e788f58c343c11")
+    
+    if has_auto_captcha:
         return jsonify({
-            'status': 'warning',
-            'message': 'No valid 2Captcha API key configured. CAPTCHA solving will require manual input.',
-            'api_key_configured': False
+            "status": "success",
+            "message": status_message,
+            "api_key_configured": API_KEY and API_KEY != "YOUR_2CAPTCHA_API_KEY" and API_KEY != "20480f95adb6216bc0e788f58c343c11",
+            "tesseract_available": TESSERACT_AVAILABLE,
+            "services": services
         })
     else:
         return jsonify({
-            'status': 'success', 
-            'message': '2Captcha API key is configured. Automatic CAPTCHA solving is available.',
-            'api_key_configured': True
+            "status": "warning",
+            "message": "No automatic CAPTCHA solving methods available. CAPTCHA solving will require manual input.",
+            "api_key_configured": False, 
+            "tesseract_available": False,
+            "services": services
         })
 
 @app.route('/api/skip_usn', methods=['POST'])
@@ -1315,7 +1687,6 @@ def run_script():
             'message': f'Error processing request: {str(e)}'
         }), 400
 
-# Create template directory and index.html if not exists
 def create_template_files():
     """Create template directory and index.html if they don't exist."""
     # Create templates directory if not exists
@@ -1364,6 +1735,19 @@ def create_template_files():
             border-top: 1px solid #eee;
             color: #777;
         }
+        .captcha-service {
+            margin-bottom: 8px;
+            padding: 8px;
+            border-radius: 4px;
+        }
+        .captcha-service.available {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+        }
+        .captcha-service.unavailable {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+        }
     </style>
 </head>
 <body>
@@ -1376,7 +1760,12 @@ def create_template_files():
                 <p class="lead">Enter the USN range to scrape results from VTU website</p>
                 
                 <div id="api-key-status" class="alert alert-warning mb-3">
-                    Checking 2Captcha API key status...
+                    Checking CAPTCHA solving services...
+                </div>
+                
+                <div id="captcha-services" class="mb-3" style="display: none;">
+                    <h5>Available CAPTCHA Solving Methods:</h5>
+                    <div id="captcha-services-list"></div>
                 </div>
                 
                 <form id="scraper-form">
@@ -1402,6 +1791,11 @@ def create_template_files():
                     </div>
                     <p class="mt-2">Scraping VTU results, please wait...</p>
                     <p class="text-muted">This may take a few minutes depending on the number of USNs</p>
+                    
+                    <div class="mt-3">
+                        <button id="skip-usn" class="btn btn-warning">Skip Current USN</button>
+                        <button id="exit-process" class="btn btn-danger ms-2">Stop & Save Results</button>
+                    </div>
                 </div>
                 
                 <div id="logs-section" class="mt-3" style="display: none;">
@@ -1454,18 +1848,90 @@ def create_template_files():
                 const result = await response.json();
                 
                 const apiKeyStatus = document.getElementById('api-key-status');
+                const captchaServices = document.getElementById('captcha-services');
+                const captchaServicesList = document.getElementById('captcha-services-list');
                 
-                if (result.api_key_configured) {
+                // Clear previous content
+                captchaServicesList.innerHTML = '';
+                
+                // Display the services
+                if (result.services && result.services.length > 0) {
+                    result.services.forEach(service => {
+                        const serviceElement = document.createElement('div');
+                        serviceElement.className = `captcha-service ${service.status}`;
+                        
+                        const statusBadge = document.createElement('span');
+                        statusBadge.className = `badge ${service.status === 'available' ? 'bg-success' : 'bg-danger'} me-2`;
+                        statusBadge.textContent = service.status === 'available' ? 'Available' : 'Unavailable';
+                        
+                        const nameElement = document.createElement('strong');
+                        nameElement.textContent = service.name;
+                        
+                        const descElement = document.createElement('p');
+                        descElement.className = 'mb-0 mt-1';
+                        descElement.textContent = service.description;
+                        
+                        serviceElement.appendChild(statusBadge);
+                        serviceElement.appendChild(nameElement);
+                        serviceElement.appendChild(descElement);
+                        
+                        captchaServicesList.appendChild(serviceElement);
+                    });
+                    
+                    captchaServices.style.display = 'block';
+                }
+                
+                if (result.tesseract_available || result.api_key_configured) {
                     apiKeyStatus.className = 'alert alert-success mb-3';
-                    apiKeyStatus.innerHTML = '<strong>Automatic CAPTCHA Solving:</strong> Enabled. The system will attempt to solve CAPTCHAs automatically.';
+                    apiKeyStatus.innerHTML = '<strong>Automatic CAPTCHA Solving:</strong> Enabled. ' + result.message;
                 } else {
                     apiKeyStatus.className = 'alert alert-warning mb-3';
-                    apiKeyStatus.innerHTML = '<strong>Automatic CAPTCHA Solving:</strong> Disabled. No valid 2Captcha API key is configured. ' +
-                        'The system will have limited functionality as CAPTCHAs cannot be solved automatically.';
+                    apiKeyStatus.innerHTML = '<strong>Automatic CAPTCHA Solving:</strong> Disabled. ' + result.message + 
+                        ' Manual input will be required for CAPTCHAs.';
                 }
             } catch (error) {
                 console.error('Error checking API key status:', error);
             }
+            
+            // Set up skip and exit buttons
+            document.getElementById('skip-usn').addEventListener('click', async function() {
+                try {
+                    const response = await fetch('/api/skip_usn', {
+                        method: 'POST'
+                    });
+                    const result = await response.json();
+                    console.log(result.message);
+                } catch (error) {
+                    console.error('Error skipping USN:', error);
+                }
+            });
+            
+            document.getElementById('exit-process').addEventListener('click', async function() {
+                try {
+                    const response = await fetch('/api/exit_process', {
+                        method: 'POST'
+                    });
+                    const result = await response.json();
+                    console.log(result.message);
+                    
+                    // If we have a filename, enable download when results are ready
+                    if (result.filename) {
+                        const downloadExcelBtn = document.getElementById('download-excel');
+                        downloadExcelBtn.onclick = function() {
+                            window.location.href = '/download/' + result.filename;
+                        };
+                        
+                        // Show a message that processing will stop
+                        const logsContent = document.getElementById('logs-content');
+                        if (logsContent) {
+                            logsContent.innerHTML += '<br><strong>Processing will be terminated and partial results saved.</strong>';
+                            document.getElementById('logs-section').style.display = 'block';
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error exiting process:', error);
+                }
+            });
         });
 
         document.getElementById('scraper-form').addEventListener('submit', async function(e) {
@@ -1791,6 +2257,49 @@ def create_template_files():
 </html>''')
         print(f"Created {demo_html_path}")
 
+# Try to download and setup Tesseract if not already available
+def download_tesseract():
+    """Download and set up Tesseract locally if not already available."""
+    print("Attempting to set up Tesseract locally...")
+    try:
+        # Create API directory
+        api_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'API')
+        tesseract_dir = os.path.join(api_dir, 'Tesseract-OCR')
+        
+        if not os.path.exists(api_dir):
+            os.makedirs(api_dir)
+            
+        if not os.path.exists(tesseract_dir):
+            os.makedirs(tesseract_dir)
+            
+        # Check if we're using a bundled Tesseract binary
+        bundled_tesseract = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'VTU-Result-Scraper-with-CAPTCHA-Bypass', 'API', 'Tesseract-OCR')
+        
+        if os.path.exists(bundled_tesseract):
+            import shutil
+            print(f"Found bundled Tesseract at {bundled_tesseract}, copying to API directory")
+            # Copy the Tesseract directory
+            shutil.copytree(bundled_tesseract, tesseract_dir, dirs_exist_ok=True)
+            return os.path.join(tesseract_dir, 'tesseract.exe')
+            
+        return None
+    except Exception as e:
+        print(f"Error setting up Tesseract: {str(e)}")
+        return None
+
+# The line below was modified to prioritize the API directory for Tesseract
+# Add API directory as first location to check
+TESSERACT_PATHS.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'API', 'Tesseract-OCR', 'tesseract.exe'))
+
+# If Tesseract isn't available, try to set it up locally
+if not TESSERACT_AVAILABLE:
+    tesseract_path = download_tesseract()
+    if tesseract_path and os.path.exists(tesseract_path):
+        TESSERACT_PATH = tesseract_path
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+        TESSERACT_AVAILABLE = True
+        print(f"Successfully set up Tesseract locally at: {TESSERACT_PATH}")
+
 if __name__ == '__main__':
     # Create template files if they don't exist
     create_template_files()
@@ -1804,9 +2313,8 @@ if __name__ == '__main__':
     print(f"{'='*50}")
     
     # Set up development mode for better manual CAPTCHA entry
-    if not os.environ.get('FORCE_DEMO') and not os.environ.get('DEVELOPMENT'):
-        print("Setting DEVELOPMENT mode for better manual CAPTCHA entry")
-        os.environ['DEVELOPMENT'] = 'True'
+    os.environ['DEVELOPMENT'] = 'True'
+    print("Setting DEVELOPMENT mode for better manual CAPTCHA entry")
     
     # Test Selenium availability
     try:
@@ -1829,6 +2337,8 @@ if __name__ == '__main__':
     if os.environ.get('FORCE_DEMO') == 'True':
         print("NOTICE: Running in DEMO MODE only")
     else:
+        # Always enable manual CAPTCHA mode by default
+        os.environ['MANUAL_CAPTCHA'] = 'True'
         print("NOTICE: Running in INTERACTIVE MODE - you'll need to type the CAPTCHAs manually")
         print("A Chrome browser window will open for each USN. Type the CAPTCHA and wait for results to load.")
     print(f"{'='*50}")
