@@ -1,6 +1,8 @@
 # VTU Results Scraper - Generated Files
 *_page.html
 *.html
+!templates/**/*.html
+!static/**/*.html
 
 # Excel Results
 vtu_results_*.xlsx
@@ -107,4 +109,4 @@ geckodriver.log
 # Windows
 Thumbs.db
 ehthumbs.db
-Desktop.ini 
+Desktop.ini
