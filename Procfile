@@ -1,1 +1,0 @@
-web: gunicorn vtu_results_hosted:app 

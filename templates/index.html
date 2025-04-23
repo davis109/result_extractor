@@ -59,6 +59,14 @@
                         </div>
                     </div>
                     
+                    <div class="row mb-3">
+                        <div class="col-md-6">
+                            <label for="skip-to-usn" class="form-label">Skip to USN (Optional)</label>
+                            <input type="text" class="form-control" id="skip-to-usn" placeholder="e.g. 1AT22CS074">
+                            <small class="form-text text-muted">Will process USNs from start to this value (excluding), then from this value to end</small>
+                        </div>
+                    </div>
+                    
                     <div class="d-grid">
                         <button type="submit" class="btn btn-primary">Scrape Results</button>
                     </div>
@@ -70,9 +78,26 @@
                     </div>
                     <p class="mt-2">Scraping VTU results, please wait...</p>
                     <p class="text-muted">This may take a few minutes depending on the number of USNs</p>
-                    <div class="mt-3">
-                        <button id="skip-usn" class="btn btn-warning me-2" style="display: none;">Skip Current USN</button>
-                        <button id="exit-process" class="btn btn-danger" style="display: none;">Exit & Save Results</button>
+                    
+                    <div class="card my-3">
+                        <div class="card-header bg-light">
+                            <h5 class="mb-0">Processing Controls</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="mb-3">
+                                <label for="jump-usn-input" class="form-label fw-bold">Jump to Specific USN:</label>
+                                <div class="input-group">
+                                    <input type="text" id="jump-usn-input" class="form-control" placeholder="e.g. 1AT22CS015">
+                                    <button id="jump-to-usn" class="btn btn-warning">Jump to USN</button>
+                                </div>
+                                <small class="form-text text-muted">Enter a USN to jump directly to it, skipping all USNs before it</small>
+                            </div>
+                            
+                            <div class="mt-3 d-flex justify-content-between">
+                                <button id="skip-usn" class="btn btn-warning">Skip Current USN</button>
+                                <button id="exit-process" class="btn btn-danger">Exit & Save Results</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 
@@ -148,13 +173,18 @@
             
             const startUsn = document.getElementById('start-usn').value;
             const endUsn = document.getElementById('end-usn').value;
+            const skipToUsn = document.getElementById('skip-to-usn').value;
             
             document.getElementById('error-message').style.display = 'none';
             document.getElementById('loading').style.display = 'block';
             document.getElementById('results-section').style.display = 'none';
             document.getElementById('logs-section').style.display = 'none';
+            
+            // Show control buttons immediately when starting the process
             document.getElementById('skip-usn').style.display = 'inline-block';
             document.getElementById('exit-process').style.display = 'inline-block';
+            
+            let processingComplete = false;
             
             try {
                 const response = await fetch('/api/scrape', {
@@ -162,9 +192,14 @@
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ start_usn: startUsn, end_usn: endUsn }),
+                    body: JSON.stringify({ 
+                        start_usn: startUsn, 
+                        end_usn: endUsn,
+                        skip_to_usn: skipToUsn || null
+                    }),
                 });
                 
+                processingComplete = true;
                 const result = await response.json();
                 
                 if (result.logs && result.logs.length > 0) {
@@ -180,12 +215,17 @@
                     showError(errorMessage);
                 }
             } catch (error) {
+                processingComplete = true;
                 showError('Failed to connect to the server. Please try again later.');
                 console.error(error);
             } finally {
-                document.getElementById('loading').style.display = 'none';
-                document.getElementById('skip-usn').style.display = 'none';
-                document.getElementById('exit-process').style.display = 'none';
+                // Only hide the loading indicator if processing is complete
+                if (processingComplete) {
+                    document.getElementById('loading').style.display = 'none';
+                    // Hide control buttons when done
+                    document.getElementById('skip-usn').style.display = 'none';
+                    document.getElementById('exit-process').style.display = 'none';
+                }
             }
         });
         
@@ -234,42 +274,172 @@
             errorElement.textContent = message;
             errorElement.style.display = 'block';
         }
+        
+        function showAlert(message, type) {
+            // Create alert element
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert alert-${type === 'error' ? 'danger' : type} alert-dismissible fade show`;
+            alertDiv.role = 'alert';
+            alertDiv.innerHTML = `
+                ${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            `;
+            
+            // Find or create container for alerts
+            let alertContainer = document.getElementById('alert-container');
+            if (!alertContainer) {
+                alertContainer = document.createElement('div');
+                alertContainer.id = 'alert-container';
+                alertContainer.className = 'position-fixed top-0 end-0 p-3';
+                alertContainer.style.zIndex = '5000';
+                document.body.appendChild(alertContainer);
+            }
+            
+            // Add alert to container
+            alertContainer.appendChild(alertDiv);
+            
+            // Auto-dismiss after 5 seconds
+            setTimeout(() => {
+                alertDiv.classList.remove('show');
+                setTimeout(() => {
+                    alertDiv.remove();
+                }, 150);
+            }, 5000);
+        }
 
-        document.getElementById('skip-usn').addEventListener('click', async function() {
+        document.getElementById('skip-usn').addEventListener('click', async function(e) {
+            e.preventDefault(); // Prevent default button action
+            
             try {
+                // Disable the button temporarily to prevent multiple clicks
+                const skipButton = document.getElementById('skip-usn');
+                skipButton.disabled = true;
+                skipButton.textContent = 'Skipping...';
+                
                 const response = await fetch('/api/skip_usn', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     }
                 });
+                
                 const result = await response.json();
+                
                 if (result.status === 'success') {
+                    // Add to logs that skip was requested
+                    const logsContent = document.getElementById('logs-content');
+                    if (logsContent && logsContent.innerHTML) {
+                        logsContent.innerHTML += '<br>Skip requested for current USN...';
+                        // Scroll to bottom of logs
+                        logsContent.scrollTop = logsContent.scrollHeight;
+                    }
                     console.log('Current USN will be skipped');
                 }
+                
+                // Re-enable the button after 2 seconds
+                setTimeout(function() {
+                    skipButton.disabled = false;
+                    skipButton.textContent = 'Skip Current USN';
+                }, 2000);
+                
             } catch (error) {
                 console.error('Error skipping USN:', error);
+                // Re-enable the button
+                document.getElementById('skip-usn').disabled = false;
+                document.getElementById('skip-usn').textContent = 'Skip Current USN';
             }
         });
 
-        document.getElementById('exit-process').addEventListener('click', async function() {
+        document.getElementById('exit-process').addEventListener('click', async function(e) {
+            e.preventDefault(); // Prevent default button action
+            
             try {
+                // Disable the button temporarily to prevent multiple clicks
+                const exitButton = document.getElementById('exit-process');
+                exitButton.disabled = true;
+                exitButton.textContent = 'Exiting...';
+                
+                // Add to logs that exit was requested
+                const logsContent = document.getElementById('logs-content');
+                if (logsContent && logsContent.innerHTML) {
+                    logsContent.innerHTML += '<br>Exit requested. Saving results...';
+                    // Scroll to bottom of logs
+                    logsContent.scrollTop = logsContent.scrollHeight;
+                }
+                
                 const response = await fetch('/api/exit_process', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     }
                 });
+                
                 const result = await response.json();
+                
                 if (result.status === 'success') {
                     console.log('Process will be terminated and partial results saved');
+                    
+                    // Display a message that processing is being terminated
+                    const loadingMessage = document.querySelector('#loading p.mt-2');
+                    if (loadingMessage) {
+                        loadingMessage.textContent = 'Terminating process and saving results...';
+                    }
+                    
                     if (result.filename) {
-                        window.location.href = '/download/' + result.filename;
+                        // Wait 3 seconds before redirecting to give user a chance to see the message
+                        setTimeout(function() {
+                            window.location.href = '/download/' + result.filename;
+                        }, 3000);
                     }
                 }
             } catch (error) {
                 console.error('Error exiting process:', error);
+                // Re-enable the button
+                document.getElementById('exit-process').disabled = false;
+                document.getElementById('exit-process').textContent = 'Exit & Save Results';
             }
+        });
+
+        async function jumpToUSN() {
+            try {
+                const jumpUSNInput = document.getElementById('jump-usn-input');
+                const targetUSN = jumpUSNInput.value.trim();
+                
+                if (!targetUSN) {
+                    showAlert('Please enter a USN to jump to', 'error');
+                    return;
+                }
+                
+                showAlert('Attempting to jump to USN ' + targetUSN + '...', 'info');
+                
+                const response = await fetch('/jump_to_usn', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        targetUsn: targetUSN
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    showAlert(data.message, 'success');
+                    // Clear the input field after successful jump
+                    jumpUSNInput.value = '';
+                } else {
+                    showAlert(data.message, 'error');
+                }
+            } catch (error) {
+                console.error('Error in jumpToUSN:', error);
+                showAlert('Failed to jump to USN: ' + error.message, 'error');
+            }
+        }
+
+        document.getElementById('jump-to-usn').addEventListener('click', function(e) {
+            e.preventDefault(); // Prevent default button action
+            jumpToUSN();
         });
     </script>
 

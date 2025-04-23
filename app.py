@@ -48,8 +48,10 @@ def scrape():
         if start_num > end_num:
             start_num, end_num = end_num, start_num
         
-        # Generate USN list
+        # Generate USN list - without any limits
         usn_list = [f"1AT22CS{str(i).zfill(3)}" for i in range(start_num, end_num + 1)]
+        
+        print(f"Processing {len(usn_list)} USNs from {usn_list[0]} to {usn_list[-1]}")
         
         # Setup driver
         driver = selenium_vtu_results.setup_driver()
@@ -149,6 +151,88 @@ def run_script():
             'status': 'error',
             'message': str(e),
             'traceback': traceback.format_exc()
+        }), 500
+
+@app.route('/jump_to_usn', methods=['POST'])
+def jump_to_usn():
+    try:
+        data = request.json
+        target_usn = data.get('targetUsn')
+        
+        if not target_usn:
+            return jsonify({
+                'success': False,
+                'message': 'No USN provided'
+            }), 400
+        
+        # Use vtu_results_hosted.py's jump_to_usn function if it's available
+        try:
+            from vtu_results_hosted import processing_active, processing_function
+            
+            if not processing_active or not processing_function:
+                # If not active, we'll proceed with our standalone implementation
+                raise ImportError("No active processing session")
+                
+            result = processing_function['jump_to_usn'](target_usn)
+            
+            if result:
+                return jsonify({
+                    'success': True,
+                    'message': f'Successfully jumped to USN: {target_usn}'
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'message': f'Failed to jump to USN: {target_usn} - not found in range or invalid format'
+                })
+                
+        except (ImportError, NameError):
+            # Standalone implementation
+            # Format USN if needed
+            if not target_usn.startswith("1AT22CS") and target_usn.isdigit():
+                try:
+                    usn_num = int(target_usn)
+                    target_usn = f"1AT22CS{str(usn_num).zfill(3)}"
+                except ValueError:
+                    return jsonify({
+                        'success': False,
+                        'message': 'Invalid USN format'
+                    }), 400
+            
+            # Setup driver
+            driver = selenium_vtu_results.setup_driver()
+            
+            try:
+                # Process just this single USN
+                results = selenium_vtu_results.process_results(driver, [target_usn])
+                
+                if results and len(results) > 0:
+                    # Check if results is a list of dictionaries (correct structure)
+                    if isinstance(results, list):
+                        # Save to Excel
+                        excel_filename = selenium_vtu_results.save_to_excel(results)
+                        
+                        return jsonify({
+                            'success': True,
+                            'message': f'Successfully found and jumped to USN: {target_usn}',
+                            'data': results[0],  # First item for display
+                            'filename': os.path.basename(excel_filename) if excel_filename else None
+                        })
+                    else:
+                        # Handle unexpected result format
+                        return jsonify({
+                            'success': False,
+                            'message': f'Invalid results format for USN: {target_usn}'
+                        })
+            finally:
+                # Close the driver
+                if driver:
+                    driver.quit()
+                    
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error processing USN: {str(e)}'
         }), 500
 
 if __name__ == '__main__':

@@ -30,6 +30,8 @@ CORS(app)  # Enable CORS for all routes
 SKIP_CURRENT_USN = False
 EXIT_PROCESSING = False
 LAST_EXCEL_FILENAME = None  # Track the last generated Excel file
+processing_active = False   # Flag to track if processing is active
+processing_function = {}    # Store jump_to_usn function reference
 
 def setup_driver():
     """Set up and return a Chrome WebDriver instance."""
@@ -240,13 +242,24 @@ def save_to_excel(all_results):
     
     return excel_filename 
 
-def process_results(driver, usn_list, manual_mode=False):
+def process_results(driver, usn_list, all_usns=None, manual_mode=False):
     """Process results for a list of USNs."""
-    global SKIP_CURRENT_USN, EXIT_PROCESSING
+    global SKIP_CURRENT_USN, EXIT_PROCESSING, processing_active, processing_function
+    
+    # Set processing flags to indicate active processing
+    processing_active = True
     
     # Reset control flags at the start of processing
     SKIP_CURRENT_USN = False
     EXIT_PROCESSING = False
+    
+    # Define the list of USNs to process
+    # This will start with the original list but can be modified based on skip requests
+    usns_to_process = usn_list.copy()
+    
+    # If all_usns is not provided, use usn_list
+    if all_usns is None:
+        all_usns = usn_list.copy()
     
     base_url = "https://results.vtu.ac.in/DJcbcs25/index.php"
     all_results = []
@@ -256,7 +269,87 @@ def process_results(driver, usn_list, manual_mode=False):
     max_retries = 3  # Maximum number of CAPTCHA retries for each USN
     retries = 0      # Current retry count
     
-    while i < len(usn_list):
+    # Helper function to check skip flag
+    def should_skip_current():
+        global SKIP_CURRENT_USN
+        if SKIP_CURRENT_USN:
+            current_usn = usns_to_process[i] if i < len(usns_to_process) else "Unknown"
+            log_message = f"Skipping USN: {current_usn} as requested by user."
+            print(log_message)
+            processing_logs.append(log_message)
+            SKIP_CURRENT_USN = False  # Reset the skip flag
+            return True
+        return False
+    
+    # Helper function to jump to a specific USN
+    def jump_to_usn(target_usn):
+        nonlocal i, retries
+        
+        print(f"Jump to USN requested: {target_usn}")
+        print(f"All USNs available: {all_usns}")
+        
+        # Make sure we're looking in the complete list of USNs, not just the current list
+        if target_usn in all_usns:
+            # Find the index of the target USN in the original list
+            target_index = all_usns.index(target_usn)
+            
+            # Calculate how many USNs we're skipping
+            current_usn = usns_to_process[i] if i < len(usns_to_process) else "Unknown"
+            
+            log_message = f"Jumping from {current_usn} directly to {target_usn}"
+            print(log_message)
+            processing_logs.append(log_message)
+            
+            # Create a new list starting from the target USN to the end of the original list
+            new_list = all_usns[target_index:]
+            usns_to_process.clear()
+            usns_to_process.extend(new_list)
+            
+            # Reset index and retry counter
+            i = 0
+            retries = 0
+            
+            return True
+        else:
+            # Check if the target USN follows the expected pattern
+            usn_pattern = re.compile(r'^1AT(\d{2})(CS|IS|ME|EE|EC|CV|AI|ML)(\d{3})$')
+            match = usn_pattern.match(target_usn)
+            
+            if match:
+                log_message = f"Adding {target_usn} to processing list even though it wasn't in original range"
+                print(log_message)
+                processing_logs.append(log_message)
+                
+                # Add the target USN to all_usns
+                all_usns.append(target_usn)
+                
+                # Update processing list to start with the target USN
+                usns_to_process.clear()
+                usns_to_process.append(target_usn)
+                
+                # Reset index and retry counter
+                i = 0
+                retries = 0
+                
+                return True
+            
+            log_message = f"Cannot jump to {target_usn}: USN not found in processing range and doesn't match expected format"
+            print(log_message)
+            processing_logs.append(log_message)
+            return False
+    
+    # Expose the jump_to_usn function globally
+    try:
+        print(f"Setting jump_to_usn_function on app object (process_results for {len(usn_list)} USNs)")
+        app.jump_to_usn_function = jump_to_usn
+        # Store in the global processing_function dictionary for the API
+        processing_function['jump_to_usn'] = jump_to_usn
+        print("Successfully set jump_to_usn_function")
+    except Exception as e:
+        print(f"ERROR: Failed to set jump_to_usn_function: {str(e)}")
+        traceback.print_exc()
+    
+    while i < len(usns_to_process):
         # Check if we should exit processing early
         if EXIT_PROCESSING:
             log_message = "Process terminated by user. Saving partial results."
@@ -264,42 +357,39 @@ def process_results(driver, usn_list, manual_mode=False):
             processing_logs.append(log_message)
             break
             
-        # Check for skip request - handle immediately for quick response
-        if SKIP_CURRENT_USN:
-            usn = usn_list[i]
-            log_message = f"Skipping USN: {usn} as requested by user."
-            print(log_message)
-            processing_logs.append(log_message)
-            i += 1  # Move to next USN
-            retries = 0  # Reset retry counter
-            SKIP_CURRENT_USN = False  # Reset the skip flag
-            continue
-        
-        usn = usn_list[i]
+        # Reset skip flag at the beginning of each iteration to ensure we check it
+        # during the current USN processing
+        usn = usns_to_process[i]
         
         # Show retry information if applicable
         if retries > 0:
             log_message = f"\nRetrying {usn} (Attempt {retries+1}/{max_retries+1})..."
         else:
-            log_message = f"\nProcessing {usn} ({i+1}/{len(usn_list)})..."
+            log_message = f"\nProcessing {usn} ({i+1}/{len(usns_to_process)})..."
             
         print(log_message)
         processing_logs.append(log_message)
+            
+        # Check for skip request - handle immediately for quick response
+        if should_skip_current():
+            i += 1  # Move to next USN
+            retries = 0  # Reset retry counter
+            continue
         
         # Navigate to the results page
         try:
             driver.get(base_url)
-            time.sleep(2)  # Wait for page to load
+            time.sleep(0.5)  # Reduced from 1 second
             
-            # Check for skip request again after page load
-            if SKIP_CURRENT_USN:
-                log_message = f"Skipping USN: {usn} as requested by user."
-                print(log_message)
-                processing_logs.append(log_message)
+            # Check for skip request after initial page load
+            if should_skip_current():
                 i += 1  # Move to next USN
                 retries = 0  # Reset retry counter
-                SKIP_CURRENT_USN = False  # Reset the skip flag
                 continue
+                
+            # Wait a bit more for complete load
+            time.sleep(0.3)  # Reduced from 1 second
+            
         except Exception as e:
             log_message = f"Error loading page: {str(e)}"
             print(log_message)
@@ -317,6 +407,12 @@ def process_results(driver, usn_list, manual_mode=False):
             "input[minlength='10'][maxlength='10']"
         ]
         
+        # Check for skip request before trying to find the input field
+        if should_skip_current():
+            i += 1  # Move to next USN
+            retries = 0  # Reset retry counter
+            continue
+            
         for selector in selectors:
             try:
                 usn_input = driver.find_element(By.CSS_SELECTOR, selector)
@@ -335,6 +431,12 @@ def process_results(driver, usn_list, manual_mode=False):
             retries = 0  # Reset retry counter
             continue
         
+        # Check for skip request before entering USN
+        if should_skip_current():
+            i += 1  # Move to next USN
+            retries = 0  # Reset retry counter
+            continue
+            
         # Enter USN
         usn_input.clear()
         usn_input.send_keys(usn)
@@ -343,13 +445,9 @@ def process_results(driver, usn_list, manual_mode=False):
         processing_logs.append(log_message)
         
         # Check if we should skip this USN (one more check before CAPTCHA)
-        if SKIP_CURRENT_USN:
-            log_message = f"Skipping USN: {usn} as requested by user."
-            print(log_message)
-            processing_logs.append(log_message)
+        if should_skip_current():
             i += 1  # Move to next USN
             retries = 0  # Reset retry counter
-            SKIP_CURRENT_USN = False  # Reset the skip flag
             continue
         
         # Find CAPTCHA input field
@@ -375,6 +473,12 @@ def process_results(driver, usn_list, manual_mode=False):
             print(log_message)
             processing_logs.append(log_message)
             
+            # Check for skip request before showing CAPTCHA
+            if should_skip_current():
+                i += 1  # Move to next USN
+                retries = 0  # Reset retry counter
+                continue
+            
             # Make the browser window visible if it's in headless mode
             if not os.environ.get('DEVELOPMENT'):
                 # Use JavaScript to make the window visible
@@ -390,14 +494,11 @@ def process_results(driver, usn_list, manual_mode=False):
             current_url = driver.current_url
             page_changed = False
             invalid_captcha = False
-            captcha_timeout = time.time() + 60
+            captcha_timeout = time.time() + 30  # Reduced from 60 seconds to 30 seconds
             
             while time.time() < captcha_timeout and not page_changed and not invalid_captcha:
                 # Check for skip request during CAPTCHA wait
-                if SKIP_CURRENT_USN:
-                    log_message = f"Skipping USN: {usn} during CAPTCHA input."
-                    print(log_message)
-                    processing_logs.append(log_message)
+                if should_skip_current():
                     break
                 
                 try:
@@ -426,20 +527,24 @@ def process_results(driver, usn_list, manual_mode=False):
                         print(log_message)
                         processing_logs.append(log_message)
                         break
-                    time.sleep(0.5)  # Check every half second
+                    time.sleep(0.3)  # Reduced from 0.5 seconds
+                    
+                    # Check for skip again
+                    if should_skip_current():
+                        break
+                        
                 except Exception as e:
                     log_message = f"Error checking page state: {str(e)}"
                     print(log_message)
                     processing_logs.append(log_message)
                     # Don't break here, just log the error and continue
-                    time.sleep(0.5)
-            
-            # If skip was requested during CAPTCHA wait
-            if SKIP_CURRENT_USN:
-                i += 1  # Move to next USN
-                retries = 0  # Reset retry counter
-                SKIP_CURRENT_USN = False  # Reset the skip flag
-                continue
+                    time.sleep(0.3)  # Reduced from 0.5 seconds
+                
+                # If skip was requested during CAPTCHA wait
+                if should_skip_current():
+                    i += 1  # Move to next USN
+                    retries = 0  # Reset retry counter
+                    continue
                 
             # If invalid captcha was detected, move to next USN
             if invalid_captcha:
@@ -461,7 +566,7 @@ def process_results(driver, usn_list, manual_mode=False):
             log_message = "Waiting for results page to load..."
             print(log_message)
             processing_logs.append(log_message)
-            time.sleep(3)
+            time.sleep(1)  # Reduced from 3 seconds
             
             # Check if we're still on the input page (CAPTCHA error)
             if "ENTER USN" in driver.page_source or "captchacode" in driver.page_source:
@@ -485,12 +590,30 @@ def process_results(driver, usn_list, manual_mode=False):
             # Continue to extract results
         else:
             # Try to solve CAPTCHA using 2Captcha
+            # Check for skip request before starting CAPTCHA solving
+            if should_skip_current():
+                i += 1  # Move to next USN
+                retries = 0  # Reset retry counter
+                continue
+                
             captcha_text = solve_captcha(driver)
             
+            # Check for skip request after CAPTCHA solving attempt
+            if should_skip_current():
+                i += 1  # Move to next USN
+                retries = 0  # Reset retry counter
+                continue
+                
             if captcha_text:
                 log_message = f"Automatically solved CAPTCHA: {captcha_text}"
                 print(log_message)
                 processing_logs.append(log_message)
+                
+                # Check for skip request before entering CAPTCHA
+                if should_skip_current():
+                    i += 1  # Move to next USN
+                    retries = 0  # Reset retry counter
+                    continue
                 
                 # Enter the CAPTCHA text
                 captcha_input.clear()
@@ -503,6 +626,12 @@ def process_results(driver, usn_list, manual_mode=False):
                 retries = 0  # Reset retry counter
                 continue
             
+            # Check for skip request before clicking submit
+            if should_skip_current():
+                i += 1  # Move to next USN
+                retries = 0  # Reset retry counter
+                continue
+                
             # Find and click the submit button
             try:
                 submit_button = driver.find_element(By.CSS_SELECTOR, "input[type='submit']")
@@ -522,7 +651,7 @@ def process_results(driver, usn_list, manual_mode=False):
             log_message = "Waiting for results page to load..."
             print(log_message)
             processing_logs.append(log_message)
-            time.sleep(3)
+            time.sleep(1)  # Reduced from 3 seconds
             
             # Check if we're still on the input page (CAPTCHA error)
             if "ENTER USN" in driver.page_source or "captchacode" in driver.page_source:
@@ -544,26 +673,38 @@ def process_results(driver, usn_list, manual_mode=False):
             retries = 0
         
         # Check for skip request one more time before extracting results
-        if SKIP_CURRENT_USN:
-            log_message = f"Skipping USN: {usn} after CAPTCHA validation."
-            print(log_message)
-            processing_logs.append(log_message)
+        if should_skip_current():
             i += 1  # Move to next USN
             retries = 0  # Reset retry counter
-            SKIP_CURRENT_USN = False  # Reset the skip flag
             continue
         
         # Extract results
         try:
+            # Check one more time for skip request before starting result extraction
+            if should_skip_current():
+                i += 1  # Move to next USN
+                retries = 0  # Reset retry counter
+                continue
+                
             # Extract student info
             student_info = {}
             student_info["USN"] = usn  # Default to input USN
             
             # Get USN and student name from the table
             try:
+                # Check for skip during table search
+                if should_skip_current():
+                    i += 1
+                    retries = 0
+                    continue
+                    
                 # Look for the table with student information
                 tables = driver.find_elements(By.TAG_NAME, "table")
                 for table in tables:
+                    # Check for skip periodically during table processing
+                    if should_skip_current():
+                        break
+                        
                     try:
                         rows = table.find_elements(By.TAG_NAME, "tr")
                         for row in rows:
@@ -590,6 +731,13 @@ def process_results(driver, usn_list, manual_mode=False):
                         log_message = f"Error processing table row: {str(e)}"
                         print(log_message)
                         processing_logs.append(log_message)
+                        
+                # If skip was requested during table processing
+                if should_skip_current():
+                    i += 1
+                    retries = 0
+                    continue
+                    
             except Exception as e:
                 log_message = f"Error finding student info table: {str(e)}"
                 print(log_message)
@@ -776,12 +924,19 @@ def process_results(driver, usn_list, manual_mode=False):
             i += 1  # Move to next USN
             retries = 0  # Reset retry counter
     
-    return all_results, processing_logs 
+    # Reset the processing flag when done
+    processing_active = False
+    return all_results, processing_logs
 
 # Define Flask routes
 @app.route('/')
 def index():
     """Render the main page."""
+    # Reset any jump function from previous sessions
+    if hasattr(app, 'jump_to_usn_function'):
+        print("Clearing previous jump_to_usn_function from app object")
+        delattr(app, 'jump_to_usn_function')
+    
     # Check if we should go directly to demo mode (e.g., if Selenium is not available)
     if os.environ.get('FORCE_DEMO') == 'True':
         return redirect(url_for('demo'))
@@ -794,6 +949,7 @@ def scrape():
         data = request.json
         start_usn = data.get('start_usn')
         end_usn = data.get('end_usn')
+        skip_to_usn = data.get('skip_to_usn')  # New parameter for skipping to a USN
         interactive_mode = data.get('interactive_mode', False)
         
         if not start_usn or not end_usn:
@@ -836,16 +992,43 @@ def scrape():
             except ValueError:
                 return jsonify({'error': 'Invalid end USN format'}), 400
         
+        # Handle skip_to_usn if provided
+        skip_num = None
+        if skip_to_usn:
+            skip_match = usn_pattern.match(skip_to_usn)
+            if skip_match:
+                skip_year = skip_match.group(1)
+                skip_branch = skip_match.group(2)
+                skip_num = int(skip_match.group(3))
+                
+                # Validate that years and branches match
+                if skip_year != start_year or skip_branch != start_branch:
+                    return jsonify({'error': 'Skip USN must have the same year and branch as start/end USN'}), 400
+            else:
+                try:
+                    # If no pattern match, try to extract just the number
+                    skip_num = int(skip_to_usn)
+                except ValueError:
+                    return jsonify({'error': 'Invalid skip USN format'}), 400
+        
         # Validate range
         if start_num > end_num:
             start_num, end_num = end_num, start_num
         
-        # Limit range for server-side processing to avoid timeouts
-        if end_num - start_num > 10:
-            end_num = start_num + 10
+        # Generate the complete USN list
+        all_usns = [f"1AT{start_year}{start_branch}{str(i).zfill(3)}" for i in range(start_num, end_num + 1)]
+        print(f"Generated all_usns: {all_usns}")
         
-        # Generate USN list with the correct pattern
-        usn_list = [f"1AT{start_year}{start_branch}{str(i).zfill(3)}" for i in range(start_num, end_num + 1)]
+        # Determine which USNs to process based on skip_to_usn
+        if skip_num and skip_num >= start_num and skip_num <= end_num:
+            # Handle as "Jump to" USN - only process from skip_to_usn onwards
+            skip_usn = f"1AT{start_year}{start_branch}{str(skip_num).zfill(3)}"
+            usn_list = [f"1AT{start_year}{start_branch}{str(i).zfill(3)}" for i in range(skip_num, end_num + 1)]
+            log_message = f"Starting directly at {skip_usn} as requested, skipping {skip_num - start_num} earlier USNs"
+        else:
+            # Process all USNs
+            usn_list = all_usns.copy() # Make a copy to avoid modifying the original list
+            log_message = f"Processing all USNs from {all_usns[0]} to {all_usns[-1]}"
         
         # Check if we should use manual mode (no automatic CAPTCHA solving)
         manual_mode = interactive_mode or not API_KEY or API_KEY == "YOUR_2CAPTCHA_API_KEY"
@@ -863,8 +1046,14 @@ def scrape():
             }), 500
         
         try:
+            # Initialize processing logs with start message
+            processing_logs = [log_message]
+            
             # Process results
-            all_results, logs = process_results(driver, usn_list, manual_mode)
+            all_results, logs = process_results(driver, usn_list, all_usns, manual_mode)
+            
+            # Combine initial log with processing logs
+            processing_logs.extend(logs)
             
             if all_results:
                 # Save results to Excel
@@ -910,20 +1099,20 @@ def scrape():
                         'status': 'success',
                         'message': f'Successfully scraped {len(simplified_results)} results',
                         'data': simplified_results,
-                        'logs': logs,
+                        'logs': processing_logs,
                         'filename': excel_filename
                     })
                 else:
                     return jsonify({
                         'status': 'error',
                         'message': 'Failed to save results to Excel',
-                        'logs': logs
+                        'logs': processing_logs
                     }), 500
             else:
                 return jsonify({
                     'status': 'error',
                     'message': 'No results found',
-                    'logs': logs
+                    'logs': processing_logs
                 }), 400
         finally:
             # Close the driver
@@ -987,16 +1176,27 @@ def check_api_key():
 def skip_usn():
     """Skip the currently processing USN."""
     global SKIP_CURRENT_USN
+    
+    print("Skip USN request received. Setting flag to skip current USN.")
+    
+    # Set the skip flag immediately
     SKIP_CURRENT_USN = True
+    
+    # Return a clear success response
     return jsonify({
         'status': 'success', 
-        'message': 'Current USN will be skipped'
+        'message': 'Current USN will be skipped immediately',
+        'skip_flag_set': True
     })
 
 @app.route('/api/exit_process', methods=['POST'])
 def exit_process():
     """Exit the current processing and save partial results."""
     global EXIT_PROCESSING, LAST_EXCEL_FILENAME
+    
+    print("Exit Processing request received. Setting flag to terminate processing.")
+    
+    # Set the exit flag immediately
     EXIT_PROCESSING = True
     
     response_data = {
@@ -1022,10 +1222,30 @@ def demo_data():
         data = request.json
         start_usn = data.get('start_usn', '1')
         end_usn = data.get('end_usn', '5')
+        skip_to_usn = data.get('skip_to_usn')
+        
+        # Convert to integers
+        start_num = int(start_usn)
+        end_num = int(end_usn)
+        skip_num = int(skip_to_usn) if skip_to_usn else None
         
         # Create sample results
         sample_results = []
-        for i in range(int(start_usn), int(end_usn) + 1):
+        
+        # Generate USN numbers based on skip parameter if provided
+        if skip_num and skip_num >= start_num and skip_num <= end_num:
+            # Jump directly to skip_num USN (skip all USNs before it)
+            usn_numbers = range(skip_num, end_num + 1)
+            log_message = f"Demo mode: Starting directly at USN {skip_num}, skipping USNs {start_num}-{skip_num-1}"
+            print(log_message)
+        else:
+            # No skipping, generate all USNs in range
+            usn_numbers = range(start_num, end_num + 1)
+            log_message = f"Demo mode: Processing all USNs {start_num}-{end_num}"
+            print(log_message)
+        
+        # Create sample results for each USN number
+        for i in usn_numbers:
             usn = f"1AT22CS{str(i).zfill(3)}"
             student = {
                 'USN': usn,
@@ -1084,6 +1304,7 @@ def demo_data():
         
         # Create sample logs
         logs = [
+            log_message,
             f"Processing demo data for {len(sample_results)} students",
             "This is sample data for demonstration purposes only",
             "No actual scraping is performed in demo mode"
@@ -1111,6 +1332,7 @@ def run_script():
         data = request.json
         start_usn = data.get('start_usn')
         end_usn = data.get('end_usn')
+        skip_to_usn = data.get('skip_to_usn')  # Add support for skip_to_usn
         interactive_mode = data.get('interactive_mode', False)
         
         if not start_usn or not end_usn:
@@ -1146,10 +1368,42 @@ def run_script():
                     end_num = int(end_usn)
                 except ValueError:
                     return jsonify({'error': 'Invalid end USN format'}), 400
+            
+            # Handle skip_to_usn if provided
+            skip_num = None
+            if skip_to_usn:
+                skip_pattern_match = re.match(r'(\d+[A-Z]{2}\d{2}[A-Z]{2})(\d{3})', skip_to_usn)
+                if skip_pattern_match:
+                    skip_prefix = skip_pattern_match.group(1)
+                    skip_num = int(skip_pattern_match.group(2))
                     
+                    # Validate that prefixes match
+                    if skip_prefix != usn_prefix:
+                        return jsonify({'error': 'Skip USN must have the same college, year, and branch codes'}), 400
+                else:
+                    try:
+                        skip_num = int(skip_to_usn)
+                    except ValueError:
+                        return jsonify({'error': 'Invalid skip USN format'}), 400
+            
             # Create demo results
             sample_results = []
-            for i in range(start_num, end_num + 1):
+            
+            # Generate USNs based on skip parameter if provided
+            usn_numbers = []
+            if skip_num and skip_num > start_num and skip_num <= end_num:
+                # Process USNs from start to skip (excluding skip_num)
+                for i in range(start_num, skip_num):
+                    usn_numbers.append(i)
+                # Process USNs from skip to end
+                for i in range(skip_num, end_num + 1):
+                    usn_numbers.append(i)
+            else:
+                # No skipping, generate all USNs in range
+                usn_numbers = range(start_num, end_num + 1)
+            
+            # Create sample results for the generated USN numbers
+            for i in usn_numbers:
                 usn = f"{usn_prefix}{str(i).zfill(3)}"
                 student = {
                     'USN': usn,
@@ -1214,23 +1468,54 @@ def run_script():
                     except ValueError:
                         return jsonify({'error': 'Invalid end USN format'}), 400
                 
+                # Handle skip_to_usn if provided
+                skip_num = None
+                if skip_to_usn:
+                    skip_pattern_match = re.match(r'(\d+[A-Z]{2}\d{2}[A-Z]{2})(\d{3})', skip_to_usn)
+                    if skip_pattern_match:
+                        skip_prefix = skip_pattern_match.group(1)
+                        skip_num = int(skip_pattern_match.group(2))
+                        
+                        # Validate that prefixes match
+                        if skip_prefix != usn_prefix:
+                            return jsonify({'error': 'Skip USN must have the same college, year, and branch codes'}), 400
+                    else:
+                        try:
+                            skip_num = int(skip_to_usn)
+                        except ValueError:
+                            return jsonify({'error': 'Invalid skip USN format'}), 400
+                
                 # Validate range
                 if start_num > end_num:
                     start_num, end_num = end_num, start_num
                 
-                # Limit range for server-side processing to avoid timeouts
-                if end_num - start_num > 10:
-                    end_num = start_num + 10
+                # Generate the complete USN list (using usn_prefix from the parsed USN)
+                all_usns = [f"{usn_prefix}{str(i).zfill(3)}" for i in range(start_num, end_num + 1)]
+                print(f"Generated all_usns: {all_usns}")
                 
-                # Generate USN list with the correct prefix
-                usn_list = [f"{usn_prefix}{str(i).zfill(3)}" for i in range(start_num, end_num + 1)]
+                # Determine which USNs to process based on skip_to_usn
+                if skip_num and skip_num >= start_num and skip_num <= end_num:
+                    # Handle as "Jump to" USN - only process from skip_to_usn onwards
+                    skip_usn = f"{usn_prefix}{str(skip_num).zfill(3)}"
+                    usn_list = [f"{usn_prefix}{str(i).zfill(3)}" for i in range(skip_num, end_num + 1)]
+                    log_message = f"Starting directly at {skip_usn} as requested, skipping {skip_num - start_num} earlier USNs"
+                else:
+                    # Process all USNs
+                    usn_list = all_usns.copy() # Make a copy to avoid modifying the original list
+                    log_message = f"Processing all USNs from {all_usns[0]} to {all_usns[-1]}"
                 
                 # Check if we should use manual mode (no automatic CAPTCHA solving)
                 manual_mode = interactive_mode or not API_KEY or API_KEY == "YOUR_2CAPTCHA_API_KEY"
                 
                 try:
+                    # Initialize processing logs with start message
+                    processing_logs = [log_message]
+                    
                     # Process results
-                    all_results, logs = process_results(driver, usn_list, manual_mode)
+                    all_results, logs = process_results(driver, usn_list, all_usns, manual_mode)
+                    
+                    # Combine initial log with processing logs
+                    processing_logs.extend(logs)
                     
                     if all_results:
                         # Save results to Excel
@@ -1276,7 +1561,7 @@ def run_script():
                                 'status': 'success',
                                 'message': f'Successfully scraped {len(simplified_results)} results',
                                 'data': simplified_results,
-                                'logs': logs,
+                                'logs': processing_logs,
                                 'filename': excel_filename
                             })
                         else:
@@ -1314,6 +1599,121 @@ def run_script():
             'status': 'error',
             'message': f'Error processing request: {str(e)}'
         }), 400
+
+@app.route('/jump_to_usn', methods=['POST'])
+def jump_to_usn_api():
+    # Use globals only if they exist
+    try:
+        global processing_active, processing_function
+        
+        target_usn = request.json.get('targetUsn', '').strip().upper()
+        
+        print(f"Jump to USN API called with target: {target_usn}")
+        
+        if not target_usn:
+            return jsonify({
+                'success': False,
+                'message': 'No USN provided'
+            }), 400
+        
+        if not processing_active or not processing_function:
+            # No active processing, use standalone implementation
+            raise ImportError("No active processing session")
+        
+        print(f"Calling jump_to_usn_function with target: {target_usn}")
+        result = processing_function['jump_to_usn'](target_usn)
+        
+        if result:
+            return jsonify({
+                'success': True,
+                'message': f'Successfully jumped to USN: {target_usn}'
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': f'Failed to jump to USN: {target_usn} - not found in range or invalid format'
+            }), 400
+            
+    except (NameError, ImportError, KeyError):
+        # Standalone implementation
+        try:
+            # Format USN if needed
+            target_usn = request.json.get('targetUsn', '').strip().upper()
+            
+            if not target_usn:
+                return jsonify({
+                    'success': False,
+                    'message': 'No USN provided'
+                }), 400
+                
+            if not target_usn.startswith("1AT22CS") and target_usn.isdigit():
+                try:
+                    usn_num = int(target_usn)
+                    target_usn = f"1AT22CS{str(usn_num).zfill(3)}"
+                except ValueError:
+                    return jsonify({
+                        'success': False,
+                        'message': 'Invalid USN format'
+                    }), 400
+            
+            # Setup driver
+            driver = setup_driver()
+            
+            try:
+                # Process just this single USN
+                results = process_results(driver, [target_usn])
+                
+                if results and len(results) > 0:
+                    # Check if results is a list or a dict
+                    if isinstance(results, list):
+                        # If it's a list, take the first item (should only be one)
+                        if len(results) > 0:
+                            result_item = results[0]
+                            # Save to Excel
+                            excel_filename = save_to_excel(results)
+                            
+                            return jsonify({
+                                'success': True,
+                                'message': f'Successfully found and jumped to USN: {target_usn}',
+                                'filename': os.path.basename(excel_filename) if excel_filename else None
+                            })
+                        else:
+                            return jsonify({
+                                'success': False,
+                                'message': f'No results found for USN: {target_usn}'
+                            })
+                    else:
+                        # Original code for dict result
+                        excel_filename = save_to_excel(results)
+                        
+                        return jsonify({
+                            'success': True,
+                            'message': f'Successfully found and jumped to USN: {target_usn}',
+                            'filename': os.path.basename(excel_filename) if excel_filename else None
+                        })
+                else:
+                    return jsonify({
+                        'success': False,
+                        'message': f'No results found for USN: {target_usn}'
+                    })
+            finally:
+                # Close the driver
+                if driver:
+                    driver.quit()
+        except Exception as e:
+            error_message = f"Error during jump to USN: {str(e)}"
+            print(error_message)
+            return jsonify({
+                'success': False,
+                'message': error_message
+            }), 500
+    except Exception as e:
+        error_message = f"Error during jump to USN: {str(e)}"
+        print(error_message)
+        return jsonify({
+            'success': False,
+            'message': error_message
+        }), 500
 
 # Create template directory and index.html if not exists
 def create_template_files():
@@ -1811,14 +2211,16 @@ if __name__ == '__main__':
     # Test Selenium availability
     try:
         print("Testing Selenium availability...")
-        test_driver = setup_driver()
-        if test_driver:
-            test_driver.quit()
-            print("✓ Selenium is working correctly")
-        else:
-            print("✗ Selenium driver setup failed")
-            print("Forcing demo mode as Selenium is not available")
-            os.environ['FORCE_DEMO'] = 'True'
+        # Skip driver testing at startup to prevent multiple Chrome windows
+        # test_driver = setup_driver()
+        # if test_driver:
+        #     test_driver.quit()
+        #     print("✓ Selenium is working correctly")
+        # else:
+        #     print("✗ Selenium driver setup failed")
+        #     print("Forcing demo mode as Selenium is not available")
+        #     os.environ['FORCE_DEMO'] = 'True'
+        print("✓ Skipping Selenium test to prevent multiple Chrome windows")
     except Exception as e:
         print(f"✗ Selenium test failed: {str(e)}")
         print("Forcing demo mode as Selenium is not available")
