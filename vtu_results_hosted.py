@@ -546,11 +546,22 @@ def process_results(driver, usn_list, all_usns=None, manual_mode=False):
                     retries = 0  # Reset retry counter
                     continue
                 
-            # If invalid captcha was detected, move to next USN
+            # If invalid captcha was detected, retry or move to next USN
             if invalid_captcha:
-                i += 1  # Move to next USN
-                retries = 0  # Reset retry counter
-                continue
+                # Instead of moving to next USN, retry the current USN if we haven't exceeded max retries
+                if retries < max_retries:
+                    retries += 1
+                    log_message = f"Invalid CAPTCHA detected for {usn}. Will retry (Attempt {retries+1}/{max_retries+1})."
+                    print(log_message)
+                    processing_logs.append(log_message)
+                    continue  # Retry the same USN
+                else:
+                    log_message = f"Maximum CAPTCHA retries ({max_retries+1}) reached for {usn}. Moving to next USN."
+                    print(log_message)
+                    processing_logs.append(log_message)
+                    i += 1  # Move to next USN
+                    retries = 0  # Reset retry counter
+                    continue
                 
             # If timeout was reached
             if not page_changed:
@@ -619,12 +630,20 @@ def process_results(driver, usn_list, all_usns=None, manual_mode=False):
                 captcha_input.clear()
                 captcha_input.send_keys(captcha_text)
             else:
-                log_message = "Automatic CAPTCHA solving failed. Skipping this USN."
-                print(log_message)
-                processing_logs.append(log_message)
-                i += 1  # Move to next USN
-                retries = 0  # Reset retry counter
-                continue
+                # Modified this section to retry instead of skipping
+                if retries < max_retries:
+                    retries += 1
+                    log_message = f"Automatic CAPTCHA solving failed for {usn}. Will retry (Attempt {retries+1}/{max_retries+1})."
+                    print(log_message)
+                    processing_logs.append(log_message)
+                    continue  # Retry the same USN
+                else:
+                    log_message = f"Maximum CAPTCHA retries ({max_retries+1}) reached for {usn}. Moving to next USN."
+                    print(log_message)
+                    processing_logs.append(log_message)
+                    i += 1  # Move to next USN
+                    retries = 0  # Reset retry counter
+                    continue
             
             # Check for skip request before clicking submit
             if should_skip_current():
@@ -2245,4 +2264,4 @@ if __name__ == '__main__':
         API_KEY = ""
     
     # Run the app
-    app.run(host='0.0.0.0', port=port, debug=os.environ.get('DEVELOPMENT', False)) 
+    app.run(host='0.0.0.0', port=port, debug=os.environ.get('DEVELOPMENT', False))
