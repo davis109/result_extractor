@@ -261,7 +261,7 @@ def process_results(driver, usn_list, all_usns=None, manual_mode=False):
     if all_usns is None:
         all_usns = usn_list.copy()
     
-    base_url = "https://results.vtu.ac.in/DJcbcs25/index.php"
+    base_url = "https://results.vtu.ac.in/JJEcbcs25/index.php"
     all_results = []
     processing_logs = []
     
@@ -312,7 +312,7 @@ def process_results(driver, usn_list, all_usns=None, manual_mode=False):
             return True
         else:
             # Check if the target USN follows the expected pattern
-            usn_pattern = re.compile(r'^1AT(\d{2})(CS|IS|ME|EE|EC|CV|AI|ML)(\d{3})$')
+            usn_pattern = re.compile(r'^1AT(\d{2})(CS|IS|ME|EE|EC|CV|AI|ML|CG)(\d{3})$')
             match = usn_pattern.match(target_usn)
             
             if match:
@@ -975,7 +975,7 @@ def scrape():
             return jsonify({'error': 'Start and end USN required'}), 400
         
         # Parse USN numbers with flexible pattern
-        usn_pattern = re.compile(r'^1AT(\d{2})(CS|IS|ME|EE|EC|CV|AI|ML)(\d{3})$')
+        usn_pattern = re.compile(r'^1AT(\d{2})(CS|IS|ME|EE|EC|CV|AI|ML|CG)(\d{3})$')
         
         # Try to match the pattern for start USN
         start_match = usn_pattern.match(start_usn)
@@ -1665,10 +1665,10 @@ def jump_to_usn_api():
                     'message': 'No USN provided'
                 }), 400
                 
-            if not target_usn.startswith("1AT22CS") and target_usn.isdigit():
+            if not target_usn.startswith("1AT") and target_usn.isdigit():
                 try:
                     usn_num = int(target_usn)
-                    target_usn = f"1AT22CS{str(usn_num).zfill(3)}"
+                    target_usn = f"1AT{str(usn_num).zfill(3)}"
                 except ValueError:
                     return jsonify({
                         'success': False,
